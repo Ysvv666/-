@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>月下涟漪 — 手势交互</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #050814; touch-action: none; }
+  #c { display: block; position: fixed; top: 0; left: 0; }
+  #v { display: none; }
+  #camHint {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    padding: 6px 16px; border-radius: 12px;
+    background: rgba(8, 10, 20, 0.55); color: rgba(180, 190, 210, 0.65);
+    font-size: 12px; z-index: 10; backdrop-filter: blur(4px); pointer-events: none;
+    font-family: "Noto Serif SC", "Source Han Serif SC", "SimSun", serif;
+    letter-spacing: 0.12em;
+  }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="v" autoplay playsinline muted></video>
+<div id="camHint"></div>
+<script>
+// ════════════════════════════════════════════════════════════
+// 月下涟漪 — Moonlit Water Simulation
+// ════════════════════════════════════════════════════════════
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+const GRID_TARGET = 400;
+const DAMPING = 0.973;
+const WAVE_SPEED = 0.09;
+const RAIN_MIN = 1600;
+const RAIN_MAX = 5200;
+
+let cols, rows, cellW, cellH;
+let current, previous, next;
+let offCanvas, offCtx;
+
+// Precompute light direction
+const LIGHT = { x: -0.5, y: -0.45, z: 0.75 };
+const LIGHT_LEN = Math.sqrt(LIGHT.x * LIGHT.x + LIGHT.y * LIGHT.y + LIGHT.z * LIGHT.z);
+const SPEC_POWER = 90;
+const HEIGHT_SCALE = 3.5;
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+
+  const aspect = canvas.width / canvas.height;
+  if (aspect > 1) {
+    cols = GRID_TARGET;
+    rows = Math.max(40, Math.floor(GRID_TARGET / aspect));
+  } else {
+    rows = GRID_TARGET;
+    cols = Math.max(40, Math.floor(GRID_TARGET * aspect));
+  }
+  cellW = canvas.width / cols;
+  cellH = canvas.height / rows;
+
+  const n = (cols + 2) * (rows + 2);
+  current = new Float32Array(n);
+  previous = new Float32Array(n);
+  next = new Float32Array(n);
+
+  offCanvas = document.createElement('canvas');
+  offCanvas.width = cols;
+  offCanvas.height = rows;
+  offCtx = offCanvas.getContext('2d');
+}
+
+function idx(x, y) { return (y + 1) * (cols + 2) + (x + 1); }
+
+function inject(cx, cy, strength, spread, dirX, dirY) {
+  const r = Math.ceil(spread * 3.5);
+  const gx = Math.round(cx / cellW);
+  const gy = Math.round(cy / cellH);
+
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      const wx = gx + dx;
+      const wy = gy + dy;
+      if (wx < 0 || wx >= cols || wy < 0 || wy >= rows) continue;
+
+      const d = Math.sqrt(dx * dx + dy * dy) / spread;
+      if (d > 3.5) continue;
+
+      let v = strength * Math.exp(-d * d / 2);
+      if (dirX !== undefined && d > 0.05) {
+        const dot = (dx * dirX + dy * dirY) / (Math.sqrt(dx * dx + dy * dy) || 1);
+        v *= 1 + dot * 0.25;
+      }
+      const i = idx(wx, wy);
+      current[i] += v;
+      previous[i] += v;
+    }
+  }
+}
+
+function simulate() {
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const i = idx(x, y);
+      const avg = (current[idx(x - 1, y)] + current[idx(x + 1, y)] +
+                   current[idx(x, y - 1)] + current[idx(x, y + 1)]) * 0.25;
+      next[i] = 2 * current[i] - previous[i] + WAVE_SPEED * (avg - current[i]);
+      next[i] *= DAMPING;
+    }
+  }
+  [previous, current, next] = [current, next, previous];
+}
+
+// ════════════════════════════════════════════════════════════
+// Moonlit Water Renderer
+// ════════════════════════════════════════════════════════════
+function render() {
+  const cw = canvas.width;
+  const ch = canvas.height;
+
+  // 1. Night water background — moonlit lake, deep indigo
+  const bg = ctx.createLinearGradient(0, 0, 0, ch);
+  bg.addColorStop(0,   '#0c1024');
+  bg.addColorStop(0.3, '#080c1c');
+  bg.addColorStop(0.6, '#050814');
+  bg.addColorStop(1,   '#030510');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, cw, ch);
+
+  // 1.5 Camera reflection — ghostly mirror image on dark water
+  if (camReady && video.readyState >= video.HAVE_CURRENT_DATA) {
+    ctx.save();
+    ctx.scale(-1, 1);
+    ctx.globalAlpha = 0.15;
+    ctx.drawImage(video, -cw, 0, cw, ch);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  // 2. Build water surface with diffuse + specular lighting
+  const img = offCtx.createImageData(cols, rows);
+  const d = img.data;
+
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const gx = current[idx(x + 1, y)] - current[idx(x - 1, y)];
+      const gy = current[idx(x, y + 1)] - current[idx(x, y - 1)];
+      const h  = current[idx(x, y)];
+
+      // Surface normal from gradient
+      const nx = -gx * HEIGHT_SCALE;
+      const ny = -gy * HEIGHT_SCALE;
+      const nz = 1.0;
+      const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+
+      // Diffuse (Lambert)
+      const dotL = (nx * LIGHT.x + ny * LIGHT.y + nz * LIGHT.z) / nLen;
+      const diffuse = Math.max(0, dotL / LIGHT_LEN);
+
+      // Specular (Blinn-Phong half-vector)
+      const hx = LIGHT.x;
+      const hy = LIGHT.y;
+      const hz = LIGHT.z + 1.0;
+      const hLen = Math.sqrt(hx * hx + hy * hy + hz * hz);
+      const dotH = (nx * hx + ny * hy + nz * hz) / nLen;
+      const spec = Math.pow(Math.max(0, dotH / hLen), SPEC_POWER);
+
+      // Fresnel-like edge darkening (water looks darker at glancing angles)
+      const fresnel = 1 - Math.abs(nz / nLen);
+      const edgeBoost = fresnel * 0.15;
+
+      // Height modulation — peaks catch more light, troughs are darker
+      const hMod = h * 0.2;
+
+      const ambient = 0.10;
+      const brightness = Math.max(0, Math.min(1,
+        ambient + 0.5 * diffuse + 0.48 * spec + hMod + edgeBoost
+      ));
+
+      // Moonlit water palette: deep indigo → silver → bright white specular
+      const di = (y * cols + x) * 4;
+
+      if (brightness < 0.012) {
+        d[di]     = 5;
+        d[di + 1] = 8;
+        d[di + 2] = 18;
+        d[di + 3] = 255;
+        continue;
+      }
+
+      // Silver-blue moonlit ripples
+      const r = Math.floor(8  + brightness * 130 + spec * 140);
+      const g = Math.floor(10 + brightness * 140 + spec * 130);
+      const b = Math.floor(18 + brightness * 155 + spec * 110);
+
+      d[di]     = Math.min(255, r);
+      d[di + 1] = Math.min(255, g);
+      d[di + 2] = Math.min(255, b);
+      d[di + 3] = 255;
+    }
+  }
+
+  offCtx.putImageData(img, 0, 0);
+
+  // 3. Draw water surface with smooth interpolation
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(offCanvas, 0, 0, cw, ch);
+
+  // 4. Subtle specular bloom overlay (larger, softer highlights on top)
+  ctx.globalCompositeOperation = 'lighter';
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const gx = current[idx(x + 1, y)] - current[idx(x - 1, y)];
+      const gy = current[idx(x, y + 1)] - current[idx(x, y - 1)];
+      const nx = -gx * HEIGHT_SCALE;
+      const ny = -gy * HEIGHT_SCALE;
+      const nz = 1.0;
+      const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      const hx = LIGHT.x, hy = LIGHT.y, hz = LIGHT.z + 1.0;
+      const hLen = Math.sqrt(hx * hx + hy * hy + hz * hz);
+      const dotH = (nx * hx + ny * hy + nz * hz) / nLen;
+      const specBloom = Math.pow(Math.max(0, dotH / hLen), 35);
+
+      if (specBloom > 0.5) {
+        const alpha = (specBloom - 0.5) * 0.15;
+        ctx.fillStyle = `rgba(210,220,240,${alpha.toFixed(3)})`;
+        ctx.fillRect(x * cellW - cellW, y * cellH - cellH, cellW * 3, cellH * 3);
+      }
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+
+  // 5. Fingertip markers — 萤火 (firefly) warm glow on dark water
+  if (camReady) {
+    for (const f of trackedTips) {
+      const fx = (1 - f.x) * cw;
+      const fy = f.y * ch;
+
+      // Soft golden bloom
+      const glow = ctx.createRadialGradient(fx, fy, 1, fx, fy, 12);
+      glow.addColorStop(0, 'rgba(240, 200, 120, 0.35)');
+      glow.addColorStop(0.5, 'rgba(220, 170, 90, 0.1)');
+      glow.addColorStop(1, 'rgba(200, 150, 60, 0)');
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(fx, fy, 12, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Core spark
+      ctx.fillStyle = 'rgba(250, 220, 150, 0.55)';
+      ctx.beginPath();
+      ctx.arc(fx, fy, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+// Touch / Mouse — 触控涟漪
+// ════════════════════════════════════════════════════════════
+const pointers = new Map();
+
+function toXY(e) {
+  if (e.touches) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  return { x: e.clientX, y: e.clientY };
+}
+
+function handleDown(e) {
+  e.preventDefault();
+  for (const t of e.changedTouches || [e]) {
+    const { x, y } = 'identifier' in t ? { x: t.clientX, y: t.clientY } : toXY(e);
+    pointers.set(t.identifier ?? 'mouse', { x, y, px: x, py: y });
+    // Broad, soft touch — like finger touching still water
+    inject(x, y, -0.45, 10);
+  }
+}
+
+function handleMove(e) {
+  e.preventDefault();
+  for (const t of (e.touches || [e])) {
+    const id = t.identifier ?? 'mouse';
+    const p = pointers.get(id);
+    if (!p) continue;
+    const dx = t.clientX - p.x;
+    const dy = t.clientY - p.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    if (dist > 4) {
+      const ndx = dx / dist;
+      const ndy = dy / dist;
+      const steps = Math.ceil(dist / 7);
+      for (let s = 0; s <= steps; s++) {
+        const t2 = s / steps;
+        const ix = p.x + dx * t2;
+        const iy = p.y + dy * t2;
+        const speed = Math.min(1, dist / 50);
+        inject(ix, iy, -0.35 * (1 + speed * 0.4), 9.0, ndx * speed * 0.5, ndy * speed * 0.5);
+      }
+    }
+    p.px = p.x; p.py = p.y;
+    p.x = t.clientX; p.y = t.clientY;
+  }
+}
+
+function handleUp(e) {
+  e.preventDefault();
+  for (const t of e.changedTouches || [e]) {
+    pointers.delete(t.identifier ?? 'mouse');
+  }
+}
+
+canvas.addEventListener('mousedown', handleDown);
+canvas.addEventListener('mousemove', handleMove);
+canvas.addEventListener('mouseup', handleUp);
+canvas.addEventListener('mouseleave', handleUp);
+canvas.addEventListener('touchstart', handleDown, { passive: false });
+canvas.addEventListener('touchmove', handleMove, { passive: false });
+canvas.addEventListener('touchend', handleUp, { passive: false });
+canvas.addEventListener('touchcancel', handleUp, { passive: false });
+
+// ════════════════════════════════════════════════════════════
+// Camera + MediaPipe Hands
+// ════════════════════════════════════════════════════════════
+const video = document.getElementById('v');
+const camHint = document.getElementById('camHint');
+
+const FINGERTIP_IDS = [4, 8, 12, 16, 20];
+
+let camReady = false;
+let mpBusy = false;
+let trackedTips = [];
+
+async function startCamera() {
+  camHint.textContent = '启墨 · 正在启动摄像头...';
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+      audio: false
+    });
+    video.srcObject = stream;
+
+    await new Promise((resolve, reject) => {
+      video.onloadedmetadata = () => video.play().then(resolve).catch(reject);
+      video.onerror = () => reject(new Error('Video error'));
+      setTimeout(() => reject(new Error('Timeout')), 5000);
+    });
+
+    camReady = true;
+    initMediaPipe();
+  } catch (e) {
+    console.error('Camera error:', e.message || e);
+    camHint.textContent = '摄像头不可用 — 触控 / 落墨';
+  }
+}
+
+function initMediaPipe() {
+  if (typeof Hands === 'undefined') {
+    camHint.textContent = 'MediaPipe 加载失败，请刷新重试';
+    return;
+  }
+
+  camHint.textContent = '研墨 · 加载手势模型...';
+
+  const hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
+  });
+
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.5
+  });
+
+  hands.onResults((results) => {
+    const newTips = [];
+
+    if (results.multiHandLandmarks) {
+      for (const lm of results.multiHandLandmarks) {
+        for (const id of FINGERTIP_IDS) {
+          newTips.push({ x: lm[id].x, y: lm[id].y });
+        }
+      }
+    }
+
+    for (const prev of trackedTips) prev.alive = false;
+
+    for (const det of newTips) {
+      let best = null, bestD = 0.05;
+      for (const prev of trackedTips) {
+        if (prev.alive) continue;
+        const d = Math.hypot(det.x - prev.x, det.y - prev.y);
+        if (d < bestD) { bestD = d; best = prev; }
+      }
+      if (best) {
+        best.px = best.x; best.py = best.y;
+        best.x = det.x; best.y = det.y;
+        best.alive = true;
+      } else {
+        trackedTips.push({ x: det.x, y: det.y, px: det.x, py: det.y, alive: true });
+      }
+    }
+
+    trackedTips = trackedTips.filter(t => t.alive);
+
+    for (const t of trackedTips) {
+      const dx = t.x - t.px;
+      const dy = t.y - t.py;
+      const dist = Math.hypot(dx, dy);
+      if (dist > 0.002) {
+        const sx = (1 - t.x) * canvas.width;
+        const sy = t.y * canvas.height;
+        const speed = Math.min(1, dist / 0.02);
+        inject(sx, sy, -0.3 * (1 + speed * 0.3), 10);
+      }
+    }
+
+    camHint.textContent = `笔锋 · ${trackedTips.length} 指`;
+  });
+
+  window._mpHands = hands;
+  camHint.textContent = '月下就绪 · 以手为笔';
+}
+
+// ════════════════════════════════════════════════════════════
+// Rain — 天降墨滴
+// ════════════════════════════════════════════════════════════
+function scheduleRain() {
+  const delay = RAIN_MIN + Math.random() * (RAIN_MAX - RAIN_MIN);
+  setTimeout(() => {
+    if (!camReady) {
+      inject(
+        Math.random() * canvas.width,
+        Math.random() * canvas.height,
+        -0.35,
+        8.5
+      );
+    }
+    scheduleRain();
+  }, delay);
+}
+
+// ════════════════════════════════════════════════════════════
+// Main Loop
+// ════════════════════════════════════════════════════════════
+let frameCount = 0;
+
+function loop() {
+  simulate();
+  render();
+
+  if (camReady && window._mpHands && !mpBusy && frameCount % 3 === 0) {
+    mpBusy = true;
+    window._mpHands.send({ image: video }).then(() => { mpBusy = false; }).catch(() => { mpBusy = false; });
+  }
+
+  frameCount++;
+  requestAnimationFrame(loop);
+}
+
+resize();
+window.addEventListener('resize', resize);
+scheduleRain();
+startCamera();
+loop();
+</script>
+</body>
+</html>

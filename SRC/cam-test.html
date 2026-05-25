@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>摄像头测试</title>
+<style>
+  body { background: #111; color: #fff; font-family: sans-serif; padding: 20px; }
+  video { width: 320px; height: 240px; border: 2px solid #f00; display: block; margin: 10px 0; }
+  canvas { width: 320px; height: 240px; border: 2px solid #0f0; display: block; margin: 10px 0; }
+  button { padding: 12px 24px; font-size: 16px; cursor: pointer; margin-bottom: 5px; }
+  #log { margin-top: 10px; color: #aaa; font-size: 13px; white-space: pre-wrap; font-family: monospace; }
+  .err { color: #f66; }
+  .ok { color: #6f6; }
+  .warn { color: #fa0; }
+  .label { color: #888; font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h2>摄像头诊断</h2>
+<button id="btn">启动摄像头</button>
+<button id="btn2" style="display:none;">检测像素数据</button>
+<div>
+  <div class="label">← &lt;video&gt; 元素（红框）</div>
+  <video id="v" width="320" height="240" autoplay playsinline></video>
+  <div class="label">← &lt;canvas&gt; 渲染（绿框，从 video 绘制）</div>
+  <canvas id="cv" width="320" height="240"></canvas>
+</div>
+<div id="log"></div>
+
+<script>
+const log = document.getElementById('log');
+const btn = document.getElementById('btn');
+const btn2 = document.getElementById('btn2');
+const vid = document.getElementById('v');
+const cv = document.getElementById('cv');
+const cCtx = cv.getContext('2d');
+
+let streamRef = null;
+
+function say(msg, cls) {
+  log.innerHTML += `<div class="${cls || ''}">${msg}</div>`;
+}
+
+btn.addEventListener('click', async () => {
+  btn.disabled = true;
+  btn.textContent = '启动中...';
+  log.innerHTML = '';
+
+  // List devices
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter(d => d.kind === 'videoinput');
+    say(`发现 ${cams.length} 个摄像头:`, 'ok');
+    cams.forEach(c => say(`  - ${c.label || '(无标签)'} (${c.deviceId.slice(0, 8)}...)`, 'ok'));
+    if (cams.length === 0) say('⚠ 未检测到摄像头设备！', 'warn');
+  } catch(e) {
+    say(`枚举设备失败: ${e.message}`, 'err');
+  }
+
+  try {
+    say('请求摄像头 (video: true)...', 'ok');
+    streamRef = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    const track = streamRef.getVideoTracks()[0];
+    say(`轨道: ${track.label}, 状态: ${track.readyState}`, 'ok');
+
+    const settings = track.getSettings();
+    say(`分辨率: ${settings.width}x${settings.height}, 帧率: ${settings.frameRate}`, 'ok');
+
+    vid.srcObject = streamRef;
+
+    await new Promise((resolve, reject) => {
+      vid.onloadedmetadata = () => {
+        say(`videoWidth: ${vid.videoWidth}, videoHeight: ${vid.videoHeight}`, 'ok');
+        resolve();
+      };
+      vid.onerror = () => reject(new Error('video element error'));
+      setTimeout(() => reject(new Error('超时')), 8000);
+    });
+
+    await vid.play();
+    say('video.play() 成功', 'ok');
+
+    // Wait 1.5s then sample pixels
+    say('等待 1.5 秒收集帧...', 'ok');
+    await new Promise(r => setTimeout(r, 1500));
+
+    // Draw video to canvas
+    cCtx.drawImage(vid, 0, 0, 320, 240);
+    const img = cCtx.getImageData(0, 0, 320, 240);
+    const d = img.data;
+
+    // Sample 9 points
+    const pts = [
+      [50, 50], [160, 120], [270, 190],
+      [10, 10], [310, 230], [160, 10],
+      [160, 230], [10, 120], [310, 120]
+    ];
+    let allBlack = true;
+    say('--- 像素采样 (R,G,B) ---', 'ok');
+    for (const [x, y] of pts) {
+      const i = (y * 320 + x) * 4;
+      const r = d[i], g = d[i+1], b = d[i+2];
+      say(`  (${String(x).padStart(3)},${String(y).padStart(3)}): R=${String(r).padStart(3)} G=${String(g).padStart(3)} B=${String(b).padStart(3)}`, r+g+b > 30 ? 'ok' : 'warn');
+      if (r + g + b > 30) allBlack = false;
+    }
+
+    if (allBlack) {
+      say('', 'err');
+      say('❌ 所有像素为黑色 —— 摄像头虽然"已连接"但返回的是纯黑帧。', 'err');
+      say('', 'err');
+      say('可能原因：', 'warn');
+      say('  1. Windows 设置 → 隐私 → 摄像头 → 确保"允许应用访问摄像头"已开启', 'warn');
+      say('  2. 联想电脑可能有物理隐私挡板（摄像头旁边的滑块），检查是否关闭', 'warn');
+      say('  3. 其他应用正在独占摄像头', 'warn');
+      say('  4. 尝试重启浏览器或换 Edge/Chrome', 'warn');
+    } else {
+      say('', 'ok');
+      say('✅ 检测到非黑像素！摄像头正在输出真实画面。', 'ok');
+      say('如果 video 元素仍显示黑色 → CSS/渲染问题', 'ok');
+      say('如果 canvas 也显示黑色 → 其他问题', 'ok');
+    }
+
+    btn.textContent = '✅ 完成';
+    btn2.style.display = 'inline';
+
+  } catch(e) {
+    say(`❌ 失败: ${e.name || 'Error'} — ${e.message}`, 'err');
+    btn.textContent = '重试';
+    btn.disabled = false;
+  }
+});
+
+btn2.addEventListener('click', () => {
+  cCtx.drawImage(vid, 0, 0, 320, 240);
+  const img = cCtx.getImageData(0, 0, 320, 240);
+  const d = img.data;
+  let sum = 0, n = 0;
+  for (let i = 0; i < d.length; i += 16) {
+    sum += d[i] + d[i+1] + d[i+2];
+    n += 3;
+  }
+  const avg = sum / n;
+  say(`实时采样：平均亮度 = ${avg.toFixed(1)} / 255 ${avg > 10 ? '✅ 有画面' : '⚠ 近乎全黑'}`, avg > 10 ? 'ok' : 'warn');
+});
+</script>
+</body>
+</html>
